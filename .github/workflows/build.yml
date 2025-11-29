@@ -1,67 +1,40 @@
-name: C++ Cross-Platform Build
+name: Windows Build
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:          # 手动触发也行
+  workflow_dispatch:          # 手动触发
 
 jobs:
-  # -------- Linux --------
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install build tools
-      run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
-
-    - name: Configure & Build
-      run: |
-        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
-        ninja -C build
-
-    - name: Upload Linux binary
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-x64-artifact
-        path: build/your_app_name          # ① 换成真实可执行文件名
-        retention-days: 30
-
   # -------- Windows --------
   build-windows:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
 
-    - name: Configure & Build
-      run: |
-        cmake -G "Visual Studio 17 2022" -A x64 -S . -B build -DCMAKE_BUILD_TYPE=Release
-        cmake --build build --config Release
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
 
-    - name: Upload Windows binary
+    - name: Build Release x64
+      run: |
+        msbuild mc_server_check.sln /p:Configuration=Release /p:Platform=x64
+
+    - name: Upload Windows x64 binary
       uses: actions/upload-artifact@v4
       with:
-        name: win-x64-artifact
-        path: build/Release/your_app_name.exe   # ② 换成真实 exe 文件名
+        name: mc_server_check-win-x64
+        path: x64/Release/mc_server_check.exe
         retention-days: 30
 
-  # -------- macOS (Intel + Apple Silicon 通用二进制) --------
-  build-macos:
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Configure & Build
+    - name: Build Release x86
       run: |
-        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
-        ninja -C build
+        msbuild mc_server_check.sln /p:Configuration=Release /p:Platform=x86
 
-    - name: Upload macOS universal binary
+    - name: Upload Windows x86 binary
       uses: actions/upload-artifact@v4
       with:
-        name: macos-universal-artifact
-        path: build/your_app_name          # ③ 换成真实可执行文件名
+        name: mc_server_check-win-x86
+        path: Release/mc_server_check.exe
         retention-days: 30

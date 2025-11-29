@@ -8,6 +8,7 @@
  *   5. 输出检测报告
  */
 
+#define _CRT_SECURE_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
@@ -30,6 +31,33 @@
 #pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
+// 控制台输出句柄
+static HANDLE g_hConsole = INVALID_HANDLE_VALUE;
+
+// 使用WriteConsoleW输出宽字符串
+void PrintW(const wchar_t* wstr) {
+    if (g_hConsole == INVALID_HANDLE_VALUE) {
+        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+    DWORD written;
+    WriteConsoleW(g_hConsole, wstr, (DWORD)wcslen(wstr), &written, nullptr);
+}
+
+// 输出ASCII字符串（用于变量内容）
+void PrintA(const char* str) {
+    if (g_hConsole == INVALID_HANDLE_VALUE) {
+        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+    DWORD written;
+    WriteConsoleA(g_hConsole, str, (DWORD)strlen(str), &written, nullptr);
+}
+
+// 便捷宏
+#define PRINT(x) PrintW(x)
+#define PRINTLN(x) do { PrintW(x); PrintW(L"\n"); } while(0)
+#define PRINTA(x) PrintA(x)
+#define PRINTLNA(x) do { PrintA(x); PrintW(L"\n"); } while(0)
+
 // 诊断结果结构
 struct DiagnosticResult {
     std::string serverDomain;
@@ -43,11 +71,6 @@ struct DiagnosticResult {
     int tcpLatencyMs = -1;
     bool pingSuccess = false;
     int pingLatencyMs = -1;
-    bool mcHandshakeSuccess = false;
-    std::string mcServerVersion;
-    std::string mcMotd;
-    int mcOnlinePlayers = -1;
-    int mcMaxPlayers = -1;
     bool localNetworkOk = false;
     std::vector<std::string> possibleReasons;
 };
@@ -206,214 +229,6 @@ bool TestTCPConnection(const std::string& ip, int port, int& latencyMs, int time
     return true;
 }
 
-// 写入VarInt
-int WriteVarInt(unsigned char* buffer, int value) {
-    int written = 0;
-    while (true) {
-        if ((value & ~0x7F) == 0) {
-            buffer[written++] = (unsigned char)value;
-            return written;
-        }
-        buffer[written++] = (unsigned char)((value & 0x7F) | 0x80);
-        value = ((unsigned int)value) >> 7;
-    }
-}
-
-// 读取VarInt
-int ReadVarInt(const unsigned char* buffer, int& bytesRead) {
-    int value = 0;
-    int shift = 0;
-    bytesRead = 0;
-    
-    while (true) {
-        unsigned char b = buffer[bytesRead++];
-        value |= (b & 0x7F) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
-        if (shift >= 32) break;
-    }
-    
-    return value;
-}
-
-// Minecraft握手协议测试
-bool TestMinecraftHandshake(const std::string& ip, int port, std::string& version, std::string& motd, int& online, int& maxPlayers) {
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        return false;
-    }
-    
-    // 设置超时
-    int timeout = 5000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-    
-    struct sockaddr_in server = {};
-    server.sin_family = AF_INET;
-    server.sin_port = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &server.sin_addr);
-    
-    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
-        closesocket(sock);
-        return false;
-    }
-    
-    // 构建握手包
-    unsigned char packet[512];
-    int packetLen = 0;
-    
-    // 包内容
-    unsigned char content[256];
-    int contentLen = 0;
-    
-    // 包ID (0x00 for handshake)
-    content[contentLen++] = 0x00;
-    
-    // 协议版本 (使用-1表示状态请求)
-    contentLen += WriteVarInt(content + contentLen, -1);
-    
-    // 服务器地址
-    int hostLen = (int)ip.length();
-    contentLen += WriteVarInt(content + contentLen, hostLen);
-    memcpy(content + contentLen, ip.c_str(), hostLen);
-    contentLen += hostLen;
-    
-    // 端口
-    content[contentLen++] = (port >> 8) & 0xFF;
-    content[contentLen++] = port & 0xFF;
-    
-    // 下一个状态 (1 = status)
-    contentLen += WriteVarInt(content + contentLen, 1);
-    
-    // 写入包长度
-    packetLen = WriteVarInt(packet, contentLen);
-    memcpy(packet + packetLen, content, contentLen);
-    packetLen += contentLen;
-    
-    // 发送握手包
-    if (send(sock, (const char*)packet, packetLen, 0) == SOCKET_ERROR) {
-        closesocket(sock);
-        return false;
-    }
-    
-    // 发送状态请求包 (0x00)
-    unsigned char statusRequest[2];
-    statusRequest[0] = 1; // 包长度
-    statusRequest[1] = 0x00; // 包ID
-    
-    if (send(sock, (const char*)statusRequest, 2, 0) == SOCKET_ERROR) {
-        closesocket(sock);
-        return false;
-    }
-    
-    // 接收响应
-    unsigned char recvBuffer[65536];
-    int totalReceived = 0;
-    int bytesReceived;
-    
-    // 读取响应
-    bytesReceived = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
-    if (bytesReceived <= 0) {
-        closesocket(sock);
-        return false;
-    }
-    totalReceived = bytesReceived;
-    
-    closesocket(sock);
-    
-    // 解析响应
-    int offset = 0;
-    int bytesRead;
-    
-    // 读取包长度
-    int responsePacketLen = ReadVarInt(recvBuffer + offset, bytesRead);
-    offset += bytesRead;
-    
-    // 读取包ID
-    int responsePacketId = ReadVarInt(recvBuffer + offset, bytesRead);
-    offset += bytesRead;
-    
-    if (responsePacketId != 0x00) {
-        return false;
-    }
-    
-    // 读取JSON字符串长度
-    int jsonLen = ReadVarInt(recvBuffer + offset, bytesRead);
-    offset += bytesRead;
-    
-    if (jsonLen <= 0 || offset + jsonLen > totalReceived) {
-        return false;
-    }
-    
-    std::string jsonResponse((char*)recvBuffer + offset, jsonLen);
-    
-    // 简单解析JSON (不使用外部库)
-    // 查找版本
-    size_t versionPos = jsonResponse.find("\"name\"");
-    if (versionPos != std::string::npos) {
-        size_t start = jsonResponse.find(':', versionPos);
-        if (start != std::string::npos) {
-            start = jsonResponse.find('"', start + 1);
-            if (start != std::string::npos) {
-                size_t end = jsonResponse.find('"', start + 1);
-                if (end != std::string::npos) {
-                    version = jsonResponse.substr(start + 1, end - start - 1);
-                }
-            }
-        }
-    }
-    
-    // 查找MOTD (description)
-    size_t descPos = jsonResponse.find("\"description\"");
-    if (descPos != std::string::npos) {
-        size_t start = jsonResponse.find(':', descPos);
-        if (start != std::string::npos) {
-            // 可能是字符串或对象
-            size_t nextChar = jsonResponse.find_first_not_of(" \t\n\r", start + 1);
-            if (nextChar != std::string::npos) {
-                if (jsonResponse[nextChar] == '"') {
-                    size_t end = jsonResponse.find('"', nextChar + 1);
-                    if (end != std::string::npos) {
-                        motd = jsonResponse.substr(nextChar + 1, end - nextChar - 1);
-                    }
-                } else if (jsonResponse[nextChar] == '{') {
-                    // 对象形式的description，查找text字段
-                    size_t textPos = jsonResponse.find("\"text\"", nextChar);
-                    if (textPos != std::string::npos) {
-                        size_t textStart = jsonResponse.find('"', textPos + 6);
-                        if (textStart != std::string::npos) {
-                            size_t textEnd = jsonResponse.find('"', textStart + 1);
-                            if (textEnd != std::string::npos) {
-                                motd = jsonResponse.substr(textStart + 1, textEnd - textStart - 1);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // 查找在线玩家数
-    size_t onlinePos = jsonResponse.find("\"online\"");
-    if (onlinePos != std::string::npos) {
-        size_t start = jsonResponse.find(':', onlinePos);
-        if (start != std::string::npos) {
-            online = std::stoi(jsonResponse.substr(start + 1));
-        }
-    }
-    
-    // 查找最大玩家数
-    size_t maxPos = jsonResponse.find("\"max\"");
-    if (maxPos != std::string::npos) {
-        size_t start = jsonResponse.find(':', maxPos);
-        if (start != std::string::npos) {
-            maxPlayers = std::stoi(jsonResponse.substr(start + 1));
-        }
-    }
-    
-    return true;
-}
-
 // ICMP Ping测试
 bool TestPing(const std::string& ip, int& latencyMs) {
     HANDLE hIcmp = IcmpCreateFile();
@@ -487,117 +302,109 @@ bool CheckLocalNetwork() {
 
 // 生成诊断报告
 void GenerateReport(const DiagnosticResult& result) {
-    std::cout << "\n";
-    std::cout << "========================================\n";
-    std::cout << "       Minecraft 服务器连接诊断报告     \n";
-    std::cout << "========================================\n\n";
+    PRINTLN(L"");
+    PRINTLN(L"========================================");
+    PRINTLN(L"       Minecraft 服务器连接诊断报告     ");
+    PRINTLN(L"========================================");
+    PRINTLN(L"");
     
-    std::cout << "【基本信息】\n";
-    std::cout << "服务器域名：" << result.serverDomain << "\n";
+    PRINTLN(L"【基本信息】");
+    PRINT(L"服务器域名："); PRINTLNA(result.serverDomain.c_str());
     
     if (result.srvFound) {
-        std::cout << "SRV记录：" << result.srvTarget << ":" << result.srvPort << "\n";
+        PRINT(L"SRV记录："); PRINTA(result.srvTarget.c_str()); 
+        PRINT(L":"); 
+        char portStr[16]; sprintf(portStr, "%d", result.srvPort);
+        PRINTLNA(portStr);
     }
     
     if (result.dnsSuccess) {
-        std::cout << "解析IP：" << result.resolvedIP << ":" << result.port << "\n";
+        PRINT(L"解析IP："); PRINTA(result.resolvedIP.c_str());
+        PRINT(L":");
+        char portStr[16]; sprintf(portStr, "%d", result.port);
+        PRINTLNA(portStr);
     } else {
-        std::cout << "解析IP：解析失败\n";
+        PRINTLN(L"解析IP：解析失败");
     }
     
-    std::cout << "\n【连通性检测】\n";
+    PRINTLN(L"");
+    PRINTLN(L"【连通性检测】");
     
     // Ping状态
-    std::cout << "Ping：";
+    PRINT(L"Ping：");
     if (result.pingSuccess) {
-        std::cout << result.pingLatencyMs << "ms\n";
+        char buf[32]; sprintf(buf, "%dms", result.pingLatencyMs);
+        PRINTLNA(buf);
     } else {
-        std::cout << "超时/不可达\n";
+        PRINTLN(L"超时/不可达");
     }
     
     // TCP连接状态
-    std::cout << "TCP连接：";
+    PRINT(L"TCP连接：");
     if (result.tcpConnectable) {
-        std::cout << "成功 (" << result.tcpLatencyMs << "ms)\n";
+        wchar_t buf[64]; swprintf(buf, 64, L"成功 (%dms)", result.tcpLatencyMs);
+        PRINTLN(buf);
     } else {
-        std::cout << "失败\n";
+        PRINTLN(L"失败");
     }
     
-    // MC握手状态
-    std::cout << "MC握手：";
-    if (result.mcHandshakeSuccess) {
-        std::cout << "成功\n";
-        std::cout << "  服务器版本：" << result.mcServerVersion << "\n";
-        if (!result.mcMotd.empty()) {
-            std::cout << "  服务器MOTD：" << result.mcMotd << "\n";
-        }
-        if (result.mcOnlinePlayers >= 0) {
-            std::cout << "  在线玩家：" << result.mcOnlinePlayers << "/" << result.mcMaxPlayers << "\n";
-        }
-    } else {
-        std::cout << "未收到服务器响应\n";
-    }
-    
-    std::cout << "\n【诊断结果】\n";
+    PRINTLN(L"");
+    PRINTLN(L"【诊断结果】");
     
     // DNS检测结果
     if (result.dnsSuccess) {
-        std::cout << "[OK] DNS解析正常\n";
+        PRINTLN(L"[OK] DNS解析正常");
     } else {
-        std::cout << "[X] DNS解析失败（请尝试修改DNS或检查域名是否正确）\n";
+        PRINTLN(L"[X] DNS解析失败（请尝试修改DNS或检查域名是否正确）");
     }
     
     // 本地网络检测
     if (result.localNetworkOk) {
-        std::cout << "[OK] 本地网络正常\n";
+        PRINTLN(L"[OK] 本地网络正常");
     } else {
-        std::cout << "[X] 本地网络异常（请检查网络连接）\n";
+        PRINTLN(L"[X] 本地网络异常（请检查网络连接）");
     }
     
     // Ping检测结果
     if (result.pingSuccess) {
-        std::cout << "[OK] Ping正常\n";
+        PRINTLN(L"[OK] Ping正常");
     } else if (result.dnsSuccess) {
-        std::cout << "[!] Ping不通（服务器可能禁用了ICMP或被网络屏蔽）\n";
+        PRINTLN(L"[!] Ping不通（服务器可能禁用了ICMP或被网络屏蔽）");
     }
     
     // TCP检测结果
     if (result.tcpConnectable) {
-        std::cout << "[OK] TCP端口可达\n";
+        PRINTLN(L"[OK] TCP端口可达");
     } else if (result.dnsSuccess) {
-        std::cout << "[X] TCP端口不可达\n";
-    }
-    
-    // MC握手结果
-    if (result.mcHandshakeSuccess) {
-        std::cout << "[OK] Minecraft服务器响应正常\n";
-    } else if (result.tcpConnectable) {
-        std::cout << "[X] 未收到Minecraft服务器握手响应\n";
+        PRINTLN(L"[X] TCP端口不可达");
     }
     
     // 输出可能的原因
     if (!result.possibleReasons.empty()) {
-        std::cout << "\n【可能的原因】\n";
+        PRINTLN(L"");
+        PRINTLN(L"【可能的原因】");
         for (size_t i = 0; i < result.possibleReasons.size(); i++) {
-            std::cout << (i + 1) << ". " << result.possibleReasons[i] << "\n";
+            wchar_t buf[16]; swprintf(buf, 16, L"%d. ", (int)(i + 1));
+            PRINT(buf);
+            PRINTLNA(result.possibleReasons[i].c_str());
         }
     }
     
     // 综合结论
-    std::cout << "\n【综合结论】\n";
-    if (result.mcHandshakeSuccess) {
-        std::cout << ">>> 服务器运行正常，可以正常连接！\n";
+    PRINTLN(L"");
+    PRINTLN(L"【综合结论】");
+    if (result.tcpConnectable) {
+        PRINTLN(L">>> 服务器端口可达，应该可以正常连接！");
     } else if (!result.localNetworkOk) {
-        std::cout << ">>> 您的本地网络存在问题，请先检查网络连接。\n";
+        PRINTLN(L">>> 您的本地网络存在问题，请先检查网络连接。");
     } else if (!result.dnsSuccess) {
-        std::cout << ">>> 域名解析失败，请检查服务器地址是否正确或尝试更换DNS。\n";
-    } else if (!result.tcpConnectable) {
-        std::cout << ">>> 无法连接到服务器端口，服务器可能未开启或端口被屏蔽。\n";
+        PRINTLN(L">>> 域名解析失败，请检查服务器地址是否正确或尝试更换DNS。");
     } else {
-        std::cout << ">>> TCP连接成功但MC握手失败，服务器可能不是Minecraft服务器或版本不兼容。\n";
+        PRINTLN(L">>> 无法连接到服务器端口，服务器可能未开启或端口被屏蔽。");
     }
     
-    std::cout << "\n========================================\n";
+    PRINTLN(L"");
+    PRINTLN(L"========================================");
 }
 
 // 分析问题并生成可能原因
@@ -626,29 +433,23 @@ void AnalyzeProblem(DiagnosticResult& result) {
         result.possibleReasons.push_back("服务器防火墙阻止了该端口的访问");
         result.possibleReasons.push_back("端口号错误，请确认正确的端口号");
     }
-    
-    if (result.tcpConnectable && !result.mcHandshakeSuccess) {
-        result.possibleReasons.push_back("该端口上运行的可能不是Minecraft服务器");
-        result.possibleReasons.push_back("服务器正在启动中，尚未完全加载");
-        result.possibleReasons.push_back("服务器版本过旧，不支持当前的查询协议");
-        result.possibleReasons.push_back("服务器安装了禁止查询的插件");
-    }
 }
 
 // 执行完整诊断
 DiagnosticResult PerformDiagnostic(const std::string& serverAddress) {
     DiagnosticResult result;
     
-    std::cout << "\n正在诊断服务器: " << serverAddress << "\n";
-    std::cout << "----------------------------------------\n";
+    PRINTLN(L"");
+    PRINT(L"正在诊断服务器: "); PRINTLNA(serverAddress.c_str());
+    PRINTLN(L"----------------------------------------");
     
     // 解析地址
     ParseServerAddress(serverAddress, result.serverDomain, result.port);
     
     // 1. 检查本地网络
-    std::cout << "[1/5] 检查本地网络... ";
+    PRINT(L"[1/5] 检查本地网络... ");
     result.localNetworkOk = CheckLocalNetwork();
-    std::cout << (result.localNetworkOk ? "正常" : "异常") << "\n";
+    PRINTLN(result.localNetworkOk ? L"正常" : L"异常");
     
     if (!result.localNetworkOk) {
         AnalyzeProblem(result);
@@ -656,58 +457,46 @@ DiagnosticResult PerformDiagnostic(const std::string& serverAddress) {
     }
     
     // 2. 查询SRV记录
-    std::cout << "[2/5] 查询SRV记录... ";
+    PRINT(L"[2/5] 查询SRV记录... ");
     result.srvFound = QuerySRVRecord(result.serverDomain, result.srvTarget, result.srvPort);
     if (result.srvFound) {
-        std::cout << "找到 (" << result.srvTarget << ":" << result.srvPort << ")\n";
+        wchar_t buf[256]; swprintf(buf, 256, L"找到 (%S:%d)", result.srvTarget.c_str(), result.srvPort);
+        PRINTLN(buf);
         result.serverDomain = result.srvTarget;
         result.port = result.srvPort;
     } else {
-        std::cout << "未找到（使用默认端口）\n";
+        PRINTLN(L"未找到（使用默认端口）");
     }
     
     // 3. DNS解析
-    std::cout << "[3/5] DNS解析... ";
+    PRINT(L"[3/5] DNS解析... ");
     result.dnsSuccess = ResolveDNS(result.serverDomain, result.resolvedIP);
     if (result.dnsSuccess) {
-        std::cout << result.resolvedIP << "\n";
+        PRINTLNA(result.resolvedIP.c_str());
     } else {
-        std::cout << "失败\n";
+        PRINTLN(L"失败");
         AnalyzeProblem(result);
         return result;
     }
     
     // 4. Ping测试
-    std::cout << "[4/5] Ping测试... ";
+    PRINT(L"[4/5] Ping测试... ");
     result.pingSuccess = TestPing(result.resolvedIP, result.pingLatencyMs);
     if (result.pingSuccess) {
-        std::cout << result.pingLatencyMs << "ms\n";
+        wchar_t buf[32]; swprintf(buf, 32, L"%dms", result.pingLatencyMs);
+        PRINTLN(buf);
     } else {
-        std::cout << "超时\n";
+        PRINTLN(L"超时");
     }
     
     // 5. TCP连接测试
-    std::cout << "[5/5] TCP连接测试... ";
+    PRINT(L"[5/5] TCP连接测试... ");
     result.tcpConnectable = TestTCPConnection(result.resolvedIP, result.port, result.tcpLatencyMs);
     if (result.tcpConnectable) {
-        std::cout << "成功 (" << result.tcpLatencyMs << "ms)\n";
+        wchar_t buf[64]; swprintf(buf, 64, L"成功 (%dms)", result.tcpLatencyMs);
+        PRINTLN(buf);
     } else {
-        std::cout << "失败\n";
-        AnalyzeProblem(result);
-        return result;
-    }
-    
-    // 6. Minecraft握手测试
-    std::cout << "[6/6] Minecraft握手测试... ";
-    result.mcHandshakeSuccess = TestMinecraftHandshake(
-        result.resolvedIP, result.port,
-        result.mcServerVersion, result.mcMotd,
-        result.mcOnlinePlayers, result.mcMaxPlayers
-    );
-    if (result.mcHandshakeSuccess) {
-        std::cout << "成功\n";
-    } else {
-        std::cout << "失败\n";
+        PRINTLN(L"失败");
     }
     
     AnalyzeProblem(result);
@@ -715,35 +504,38 @@ DiagnosticResult PerformDiagnostic(const std::string& serverAddress) {
 }
 
 int main() {
-    // 设置控制台编码为UTF-8
-    SetConsoleOutputCP(CP_UTF8);
+    // 初始化控制台句柄
+    g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    
+    // 设置控制台编码为UTF-8（用于输入）
     SetConsoleCP(CP_UTF8);
     
-    // 启用虚拟终端处理以支持ANSI转义序列
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    GetConsoleMode(hOut, &dwMode);
-    SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    
-    std::cout << "+--------------------------------------------+\n";
-    std::cout << "|  Minecraft Java版 服务器连接诊断工具 v1.0  |\n";
-    std::cout << "+--------------------------------------------+\n\n";
+    PRINTLN(L"+--------------------------------------------+");
+    PRINTLN(L"|  Minecraft Java版 服务器连接诊断工具 v1.0  |");
+    PRINTLN(L"+--------------------------------------------+");
+    PRINTLN(L"");
     
     if (!InitWinsock()) {
-        std::cerr << "错误：无法初始化网络组件\n";
+        PRINTLN(L"错误：无法初始化网络组件");
         return 1;
     }
     
     std::string serverAddress;
+    char inputBuffer[256];
     
     while (true) {
-        std::cout << "请输入服务器地址（例如: gddx.sakura.ink）\n";
-        std::cout << "输入 'quit' 退出程序\n";
-        std::cout << "> ";
+        PRINTLN(L"请输入服务器地址（例如: gdyd.sakura.ink）");
+        PRINTLN(L"输入 'quit' 退出程序");
+        PRINT(L"> ");
         
-        std::getline(std::cin, serverAddress);
+        // 使用fgets读取输入
+        if (fgets(inputBuffer, sizeof(inputBuffer), stdin) == nullptr) {
+            break;
+        }
         
-        // 去除首尾空格
+        serverAddress = inputBuffer;
+        
+        // 去除首尾空格和换行
         size_t start = serverAddress.find_first_not_of(" \t\r\n");
         size_t end = serverAddress.find_last_not_of(" \t\r\n");
         if (start == std::string::npos) {
@@ -756,18 +548,20 @@ int main() {
         }
         
         if (serverAddress.empty()) {
-            std::cout << "请输入有效的服务器地址\n\n";
+            PRINTLN(L"请输入有效的服务器地址");
+            PRINTLN(L"");
             continue;
         }
         
         DiagnosticResult result = PerformDiagnostic(serverAddress);
         GenerateReport(result);
         
-        std::cout << "\n";
+        PRINTLN(L"");
     }
     
     CleanupWinsock();
-    std::cout << "\n感谢使用，再见！\n";
+    PRINTLN(L"");
+    PRINTLN(L"感谢使用，再见！");
     
     return 0;
 }
